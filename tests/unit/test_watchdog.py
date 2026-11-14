@@ -135,6 +135,27 @@ def test_off_skips_the_bus_and_shadow_records_without_waking(omg_home):
         e.close()
 
 
+def test_shadow_ticks_log_written_then_unchanged_heal_snapshot(omg_home):
+    _policy({"watchdog": "shadow", "healing": "shadow"})
+    e = Engine()
+    try:
+        jid = _job(e.conn, phase="done")
+        e.conn.execute("UPDATE jobs SET repair_cycles=1 WHERE id=?", (jid,))
+        first = watchdog.tick(e, now=NOW)
+        second = watchdog.tick(e, now=NOW)
+        assert first["steps"]["heal_collect"]["status"] == "written"
+        assert first["steps"]["heal_collect"]["written"] is True
+        assert second["steps"]["heal_collect"]["status"] == "unchanged"
+        assert second["steps"]["heal_collect"]["written"] is False
+        assert e.conn.execute("SELECT COUNT(*) FROM failure_snapshots").fetchone()[0] == 1
+        assert e.conn.execute("SELECT seen_count FROM failure_snapshots").fetchone()[0] == 2
+        log = (get_paths().logs_dir / "watchdog.log").read_text()
+        assert "heal_collect=written" in log
+        assert "heal_collect=unchanged" in log
+    finally:
+        e.close()
+
+
 def test_step_failure_does_not_skip_later_steps(omg_home):
     _policy({"watchdog": "on"})
     e = Engine()

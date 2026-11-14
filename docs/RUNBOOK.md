@@ -276,7 +276,7 @@ It defaults to `off`. Do not commit that file from a live host. Other feature de
 | Mode | What a tick does |
 |---|---|
 | `off` | Writes a heartbeat. Does not reconcile, collect, detect, or wake. |
-| `shadow` | Reconcile, then `heal collect` (which still obeys `features.healing`), then stall records. No stall wakes. |
+| `shadow` | Reconcile, then `heal collect` (which still obeys `features.healing`), then stall records. No stall wakes. An unchanged heal corpus does not insert another snapshot. |
 | `on` | Same as `shadow`, and wakes a stalled role when that role has a hook in the secrets store. |
 
 Thresholds (policy keys, code defaults):
@@ -332,6 +332,17 @@ manual check, another machine). It is safe to call on a timer of any coarse peri
 
 The live checkout is still `/workspace/omo` until cutover. Use that directory, and `omoctl`, until the move. `ensure`
 does not rotate webhook keys and does not edit the policy file.
+
+`omg heal collect` (and each watchdog tick that is allowed to collect) writes a snapshot only when the repair-item
+set changed. The same set updates `seen_count` and `last_seen_at` on the latest snapshot. The tick log says
+`heal_collect=written` or `heal_collect=unchanged`. Snapshots already duplicated before schema v7 stay until an
+operator collapses them. Migrate does not delete them, and the watchdog does not either.
+
+```bash
+./omg migrate
+./omg heal prune-duplicates            # dry-run; prints how many consecutive duplicates would go
+./omg heal prune-duplicates --apply    # keep the first of each run, sum seen_count, delete the rest
+```
 
 ## Troubleshooting
 | Symptom | Cause / action |

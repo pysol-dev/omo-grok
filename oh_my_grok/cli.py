@@ -619,8 +619,19 @@ def cmd_features(args) -> int:
 def _heal_lines(r) -> str:
     lines = [f"snapshot {r['snapshot_id']}", f"sha256: {r['sha256']}", f"mode: {r['mode']}",
              f"items: {r['item_count']}"]
+    if r.get("status") in ("written", "unchanged"):
+        lines.append(f"status: {r['status']}")
+    if "seen_count" in r:
+        lines.append(f"seen: {r['seen_count']}")
     lines += [f"  {it['class']}  {it['job_id']}  {it['sha256']}" for it in r["items"]]
     return "\n".join(lines)
+
+
+def _prune_lines(r) -> str:
+    if r["dry_run"]:
+        return (f"dry-run: {r['would_delete']} consecutive duplicate snapshot(s) would be deleted; "
+                f"{r['kept_count']} kept")
+    return f"applied: deleted {r['deleted']} consecutive duplicate snapshot(s); {r['kept_count']} kept"
 
 
 def cmd_heal_collect(args) -> int:
@@ -640,6 +651,16 @@ def cmd_heal_show(args) -> int:
     finally:
         e.close()
     _out(args, r, _heal_lines(r))
+    return EXIT_OK
+
+
+def cmd_heal_prune(args) -> int:
+    e = _engine()
+    try:
+        r = e.heal_prune_duplicates(apply=bool(args.apply))
+    finally:
+        e.close()
+    _out(args, r, _prune_lines(r))
     return EXIT_OK
 
 
@@ -859,6 +880,11 @@ def build_parser() -> argparse.ArgumentParser:
     add("collect", cmd_heal_collect, "derive a failure snapshot from the database", parent=heal)
     sp = add("show", cmd_heal_show, "show one failure snapshot (latest if no id is given)", parent=heal)
     sp.add_argument("snapshot", nargs="?")
+    sp = add("prune-duplicates", cmd_heal_prune,
+             "collapse consecutive identical snapshots (dry-run unless --apply; never automatic)", parent=heal)
+    group = sp.add_mutually_exclusive_group()
+    group.add_argument("--dry-run", action="store_true", help="report only (the default)")
+    group.add_argument("--apply", action="store_true", help="delete the duplicate snapshots")
     sp = add("features", cmd_features, "show feature modes (configured, and frozen into one job)")
     sp.add_argument("job", nargs="?")
     sp = add("boulder", cmd_boulder, "show the active work (plan, phase, next action, sessions); --refresh rewrites .omo/")

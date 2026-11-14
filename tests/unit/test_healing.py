@@ -99,6 +99,30 @@ def test_migration_6_creates_snapshot_tables(tmp_path):
     assert {"failure_snapshots", "failure_items"} <= names
 
 
+def test_migration_7_preserves_existing_duplicate_snapshots(tmp_path):
+    conn = db.connect(tmp_path / "h.sqlite3")
+    assert db.migrate(conn, target=6) == [1, 2, 3, 4, 5, 6]
+    jid = _job(conn, phase="done", repair_cycles=1)
+    ids = []
+    for seq, stamp in ((1, "2026-01-01T00:00:00.000000Z"), (2, "2026-01-02T00:00:00.000000Z")):
+        sid = str(uuid.uuid4())
+        ids.append(sid)
+        conn.execute(
+            "INSERT INTO failure_snapshots(id,seq,mode,item_count,corpus_sha256,created_at) VALUES (?,?,?,?,?,?)",
+            (sid, seq, "shadow", 1, "a" * 64, stamp))
+        conn.execute(
+            "INSERT INTO failure_items(snapshot_id,ordinal,item_sha256,class,source,job_id,payload_json) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (sid, 0, "b" * 64, "repair", "repair_cycle", jid, '{"class":"repair"}'))
+    assert db.migrate(conn) == [7]
+    rows = conn.execute(
+        "SELECT id, seq, seen_count, last_seen_at, created_at FROM failure_snapshots ORDER BY seq").fetchall()
+    assert [r["id"] for r in rows] == ids
+    assert [r["seen_count"] for r in rows] == [1, 1]
+    assert [r["last_seen_at"] for r in rows] == [r["created_at"] for r in rows]
+    assert _count(conn, "SELECT COUNT(*) FROM failure_items") == 2
+
+
 def test_healing_off_refuses_and_writes_nothing(eng):
     jid = _job(eng.conn, phase="blocked", failure_reason="disk full", blocked_from="running")
     with pytest.raises(GateRefused, match="healing is off"):
@@ -113,18 +137,20 @@ def test_healing_off_refuses_and_writes_nothing(eng):
 
 def test_empty_shadow_and_enforce_write_snapshots_without_enqueueing(eng):
     shadow = collect(eng.conn, "shadow")
-    assert shadow["written"] is True and shadow["mode"] == "shadow"
+    assert shadow["written"] is True and shadow["status"] == "written" and shadow["mode"] == "shadow"
     assert shadow["item_count"] == 0 and shadow["items"] == []
-    assert shadow["sha256"] == shadow["corpus_sha256"] == _sha([])
+    assert shadow["sha256"] == shadow["corpus_sha256"] == shadow["fingerprint"] == _sha([])
+    assert shadow["seen_count"] == 1
     enforce = collect(eng.conn, "enforce")
-    assert enforce["written"] is True and enforce["mode"] == "enforce"
+    assert enforce["written"] is False and enforce["status"] == "unchanged"
+    assert enforce["snapshot_id"] == shadow["snapshot_id"]
     assert enforce["sha256"] == shadow["sha256"]
-    assert enforce["snapshot_id"] != shadow["snapshot_id"]
+    assert enforce["seen_count"] == 2
+    assert _count(eng.conn, "SELECT COUNT(*) FROM failure_snapshots") == 1
     assert _count(eng.conn, "SELECT COUNT(*) FROM jobs") == 0
     assert _count(eng.conn, "SELECT COUNT(*) FROM tasks") == 0
     assert _count(eng.conn, "SELECT COUNT(*) FROM dispatch_outbox") == 0
-    modes = [r[0] for r in eng.conn.execute("SELECT mode FROM failure_snapshots ORDER BY seq")]
-    assert modes == ["shadow", "enforce"]
+    assert _count(eng.conn, "SELECT COUNT(*) FROM events WHERE kind='failures_collected'") == 1
 
 
 def _corpus(conn):
@@ -190,18 +216,25 @@ def test_event_repair_is_not_duplicated_by_the_counter(eng):
     assert items[0]["payload"]["reason"] == "once"
 
 
-def test_second_collect_matches_item_hashes_and_ignores_its_audit_event(eng):
+def test_repeated_collect_with_unchanged_state_writes_one_snapshot(eng):
     _corpus(eng.conn)
     first = collect(eng.conn, "shadow")
     second = collect(eng.conn, "shadow")
-    assert first["snapshot_id"] != second["snapshot_id"]
-    assert first["seq"] + 1 == second["seq"]
+    third = collect(eng.conn, "shadow")
+    assert first["written"] is True and first["status"] == "written" and first["seen_count"] == 1
+    assert second["written"] is False and second["status"] == "unchanged"
+    assert third["status"] == "unchanged" and third["seen_count"] == 3
+    assert first["snapshot_id"] == second["snapshot_id"] == third["snapshot_id"]
+    assert first["seq"] == second["seq"]
     assert [i["sha256"] for i in first["items"]] == [i["sha256"] for i in second["items"]]
-    assert first["sha256"] == second["sha256"]
-    assert _count(eng.conn, "SELECT COUNT(*) FROM events WHERE kind='failures_collected'") == 2
+    assert first["sha256"] == second["sha256"] == second["fingerprint"]
+    assert _count(eng.conn, "SELECT COUNT(*) FROM failure_snapshots") == 1
+    assert _count(eng.conn, "SELECT COUNT(*) FROM events WHERE kind='failures_collected'") == 1
     latest = show(eng.conn)
-    assert latest["snapshot_id"] == second["snapshot_id"]
-    assert [i["sha256"] for i in latest["items"]] == [i["sha256"] for i in second["items"]]
+    assert latest["snapshot_id"] == first["snapshot_id"]
+    assert latest["seen_count"] == 3
+    assert latest["last_seen_at"] >= latest["created_at"]
+    assert [i["sha256"] for i in latest["items"]] == [i["sha256"] for i in first["items"]]
     earlier = show(eng.conn, first["snapshot_id"])
     assert earlier["snapshot_id"] == first["snapshot_id"]
     n = _count(eng.conn, "SELECT COUNT(*) FROM events")
@@ -211,6 +244,145 @@ def test_second_collect_matches_item_hashes_and_ignores_its_audit_event(eng):
         show(eng.conn, "00000000-0000-4000-8000-000000000000")
     with pytest.raises(ValidationError):
         show(eng.conn, "not-a-uuid")
+
+
+def test_changed_item_set_writes_a_new_snapshot(eng):
+    jid = _job(eng.conn, phase="done", repair_cycles=1)
+    first = collect(eng.conn, "shadow")
+    assert first["written"] is True and _count(eng.conn, "SELECT COUNT(*) FROM failure_snapshots") == 1
+    _event(eng.conn, jid, "repair_cycle", {"failures": 1, "reason": "verification failed", "max": 3})
+    second = collect(eng.conn, "shadow")
+    assert second["written"] is True and second["status"] == "written"
+    assert second["snapshot_id"] != first["snapshot_id"]
+    assert second["seq"] == first["seq"] + 1
+    assert second["sha256"] != first["sha256"]
+    assert second["seen_count"] == 1
+    assert _count(eng.conn, "SELECT COUNT(*) FROM failure_snapshots") == 2
+    kept = eng.conn.execute("SELECT seen_count FROM failure_snapshots WHERE id=?", (first["snapshot_id"],)).fetchone()
+    assert kept["seen_count"] == 1
+    again = collect(eng.conn, "shadow")
+    assert again["status"] == "unchanged" and again["snapshot_id"] == second["snapshot_id"]
+    assert _count(eng.conn, "SELECT COUNT(*) FROM failure_snapshots") == 2
+
+
+def _stamp(day: int) -> str:
+    return f"2026-01-{day:02d}T00:00:00.000000Z"
+
+
+def _legacy_snapshot(conn, seq, corpus, job_id, *, seen=1, created_day=1, seen_day=1):
+    sid = str(uuid.uuid4())
+    created, seen_at = _stamp(created_day), _stamp(seen_day)
+    conn.execute(
+        "INSERT INTO failure_snapshots(id,seq,mode,item_count,corpus_sha256,created_at,seen_count,last_seen_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (sid, seq, "shadow", 1, corpus, created, seen, seen_at))
+    conn.execute(
+        "INSERT INTO failure_items(snapshot_id,ordinal,item_sha256,class,source,job_id,payload_json) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (sid, 0, corpus, "repair", "repair_cycle", job_id, '{"class":"repair","source":"repair_cycle"}'))
+    return sid
+
+
+def _duplicate_run(conn):
+    """Consecutive aaa, aaa, aaa, then bbb, then a later aaa. Counts are already above 1."""
+    jid = _job(conn, phase="done", repair_cycles=1)
+    same, other = "a" * 64, "b" * 64
+    ids = [
+        _legacy_snapshot(conn, 1, same, jid, seen=2, created_day=1, seen_day=1),
+        _legacy_snapshot(conn, 2, same, jid, seen=3, created_day=2, seen_day=2),
+        _legacy_snapshot(conn, 3, same, jid, seen=4, created_day=3, seen_day=3),
+        _legacy_snapshot(conn, 4, other, jid, seen=1, created_day=4, seen_day=4),
+        _legacy_snapshot(conn, 5, same, jid, seen=1, created_day=5, seen_day=5),
+    ]
+    return jid, ids
+
+
+def test_prune_dry_run_deletes_nothing(eng):
+    from oh_my_grok.healing import prune_duplicates
+    _jid, ids = _duplicate_run(eng.conn)
+    before_snaps = _dump(eng.conn, "failure_snapshots", "seq")
+    before_items = _dump(eng.conn, "failure_items", "snapshot_id, ordinal")
+    events = _count(eng.conn, "SELECT COUNT(*) FROM events")
+    out = prune_duplicates(eng.conn, apply=False)
+    assert out["dry_run"] is True and out["applied"] is False
+    assert out["deleted"] == 0 and out["would_delete"] == 2
+    assert out["removed_ids"] == [ids[1], ids[2]]
+    assert out["snapshots_before"] == out["snapshots_after"] == 5
+    assert _dump(eng.conn, "failure_snapshots", "seq") == before_snaps
+    assert _dump(eng.conn, "failure_items", "snapshot_id, ordinal") == before_items
+    assert _count(eng.conn, "SELECT COUNT(*) FROM events") == events
+
+
+def test_prune_apply_collapses_consecutive_duplicates(eng):
+    from oh_my_grok.healing import prune_duplicates
+    _jid, ids = _duplicate_run(eng.conn)
+    out = prune_duplicates(eng.conn, apply=True)
+    assert out["dry_run"] is False and out["applied"] is True
+    assert out["deleted"] == 2 and out["would_delete"] == 2
+    assert out["removed_ids"] == [ids[1], ids[2]]
+    assert out["snapshots_before"] == 5 and out["snapshots_after"] == 3
+    assert out["kept_count"] == 3
+    rows = eng.conn.execute(
+        "SELECT id, seq, seen_count, last_seen_at FROM failure_snapshots ORDER BY seq").fetchall()
+    assert [r["id"] for r in rows] == [ids[0], ids[3], ids[4]]
+    assert rows[0]["seen_count"] == 9 and rows[0]["last_seen_at"] == _stamp(3)
+    assert rows[1]["seen_count"] == 1 and rows[1]["last_seen_at"] == _stamp(4)
+    assert rows[2]["seen_count"] == 1 and rows[2]["last_seen_at"] == _stamp(5)
+    left = [r[0] for r in eng.conn.execute("SELECT snapshot_id FROM failure_items ORDER BY snapshot_id")]
+    assert left == sorted([ids[0], ids[3], ids[4]])
+    assert _count(eng.conn, "SELECT COUNT(*) FROM events") == 0
+
+
+def test_collect_does_not_prune_older_duplicates(eng):
+    jid = _job(eng.conn, phase="done", repair_cycles=1)
+    first = collect(eng.conn, "shadow")
+    corpus = first["corpus_sha256"]
+    dup = str(uuid.uuid4())
+    eng.conn.execute(
+        "INSERT INTO failure_snapshots(id,seq,mode,item_count,corpus_sha256,created_at,seen_count,last_seen_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (dup, first["seq"] + 1, "shadow", first["item_count"], corpus, db.utcnow(), 1, db.utcnow()))
+    for item in eng.conn.execute("SELECT * FROM failure_items WHERE snapshot_id=?", (first["snapshot_id"],)):
+        eng.conn.execute(
+            "INSERT INTO failure_items(snapshot_id,ordinal,item_sha256,class,source,job_id,task_id,payload_json) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (dup, item["ordinal"], item["item_sha256"], item["class"], item["source"], item["job_id"],
+             item["task_id"], item["payload_json"]))
+    again = collect(eng.conn, "shadow")
+    assert again["status"] == "unchanged" and again["snapshot_id"] == dup
+    assert _count(eng.conn, "SELECT COUNT(*) FROM failure_snapshots") == 2
+    assert eng.conn.execute("SELECT id FROM jobs WHERE id=?", (jid,)).fetchone()["id"] == jid
+
+
+def test_cli_prune_duplicates_is_dry_run_until_apply(omg_home):
+    from oh_my_grok.engine import Engine
+    _policy("shadow")
+    e = Engine()
+    _jid, ids = _duplicate_run(e.conn)
+    e.close()
+    env = os.environ.copy()
+    dry = _run(["heal", "prune-duplicates", "--json"], env)
+    assert dry.returncode == 0, dry.stderr
+    body = json.loads(dry.stdout)
+    assert body["dry_run"] is True and body["deleted"] == 0 and body["would_delete"] == 2
+    assert "dry-run" in _run(["heal", "prune-duplicates"], env).stdout
+    e = Engine()
+    try:
+        assert _count(e.conn, "SELECT COUNT(*) FROM failure_snapshots") == 5
+    finally:
+        e.close()
+    applied = _run(["heal", "prune-duplicates", "--apply"], env)
+    assert applied.returncode == 0, applied.stderr
+    assert "deleted 2" in applied.stdout
+    checked = json.loads(_run(["heal", "prune-duplicates", "--json"], env).stdout)
+    assert checked["would_delete"] == 0 and checked["deleted"] == 0
+    e = Engine()
+    try:
+        left = [r["id"] for r in e.conn.execute("SELECT id FROM failure_snapshots ORDER BY seq")]
+        assert left == [ids[0], ids[3], ids[4]]
+        assert e.conn.execute("SELECT seen_count FROM failure_snapshots WHERE id=?", (ids[0],)).fetchone()[0] == 9
+    finally:
+        e.close()
 
 
 def test_collect_does_not_mutate_jobs_or_append_other_events(eng):
@@ -290,9 +462,14 @@ def test_cli_collect_and_show_print_a_blocked_fixture_snapshot(omg_home):
     human = _run(["heal", "collect"], env)
     assert human.returncode == 0, human.stderr
     assert jid in human.stdout and "sha256:" in human.stdout and "blocked" in human.stdout
+    assert "written" in human.stdout
     shown = json.loads(_run(["heal", "show", "--json"], env).stdout)
+    again_human = _run(["heal", "collect"], env)
+    assert again_human.returncode == 0 and "unchanged" in again_human.stdout
     again = json.loads(_run(["heal", "collect", "--json"], env).stdout)
-    assert shown["snapshot_id"] != again["snapshot_id"]
+    assert again["written"] is False and again["status"] == "unchanged"
+    assert shown["snapshot_id"] == again["snapshot_id"]
+    assert again["seen_count"] == 3
     assert [i["sha256"] for i in shown["items"]] == [i["sha256"] for i in again["items"]]
     assert any(i["class"] == "blocked" and i["job_id"] == jid for i in again["items"])
     assert len(again["sha256"]) == 64

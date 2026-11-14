@@ -12,7 +12,7 @@ Implementing slice 1 does not install it on the host and does not make the insta
 
 The healer loop is a projection plus, later, ordinary jobs:
 
-1. **Collect.** The engine reads the append-only events log and the related tables and writes a snapshot. A later disposable process, or a model, obtains that snapshot with `omg heal collect` or the MCP `heal` tool. It does not query the database to invent a corpus.
+1. **Collect.** The engine reads the append-only events log and the related tables and writes a snapshot when the item set changed. A later disposable process, or a model, obtains that snapshot with `omg heal collect` or the MCP `heal` tool. It does not query the database to invent a corpus.
 2. **Healer.** A role, independent of the author of the failing work, reads a snapshot. Not this slice.
 3. **Diagnose and propose.** The healer explains the failure and proposes a fix. Not this slice. Proposal does not enqueue.
 4. **Fix job.** `enforce` may enqueue a fix. That fix is a normal oh-my-grok job. It still needs a plan, user approval, and review. Not this slice.
@@ -22,8 +22,8 @@ Slice 1 is only step 1. In every mode, including `enforce`, collect does not enq
 
 ## 2. Hard rules
 
-- **No silent bus rewrite.** Collect does not flip a job phase, does not update a job, task, review, verification, or dispatch row, and does not append any event except one `failures_collected` audit event. That event has a null `job_id`, so it does not mark a job dirty and does not flush a boulder.
-- **Projection, not authority.** Snapshots are derived, the same way `.omo/boulder.json` is derived. The engine does not read `failure_snapshots` or `failure_items` when it decides a transition. A later collect ignores prior snapshots, including a tampered one. A model must not read the raw database to build the corpus.
+- **No silent bus rewrite.** Collect does not flip a job phase, does not update a job, task, review, verification, or dispatch row. A new snapshot appends one `failures_collected` audit event. That event has a null `job_id`, so it does not mark a job dirty and does not flush a boulder. An unchanged item set does not append that event. It only updates `seen_count` and `last_seen_at` on the latest snapshot.
+- **Projection, not authority.** Snapshots are derived, the same way `.omo/boulder.json` is derived. The engine does not read `failure_snapshots` or `failure_items` when it decides a transition. Collect builds the item set from source tables only. It reads the latest snapshot's corpus hash to skip an identical insert. A tampered item payload is not copied into the next corpus. A model must not read the raw database to build the corpus.
 - **Healer independence is slice 2.** This slice adds no roster role, no routine, no Bot binding, and no independence group. The MCP `heal` tool does not require a binding.
 - **A durable fix is a normal job.** It needs a plan, a user approval, and review. Slice 1 never creates that job. `shadow` and `enforce` differ only by the mode recorded on the snapshot.
 - **`github_review_bot` is reserved.** The name is a future source. Events of that kind are ignored. Nothing in this slice fetches GitHub review comments.
@@ -35,18 +35,18 @@ Slice 1 is only step 1. In every mode, including `enforce`, collect does not enq
 | Mode | Collect |
 |---|---|
 | `off` | Refusal (`gate_refused`, "healing is off; collect writes nothing"). No snapshot row and no `failures_collected` event. |
-| `shadow` | Writes a snapshot and one audit event. Records `mode=shadow`. Enqueues nothing. |
-| `enforce` | Same write as `shadow`, with `mode=enforce`. Enqueues nothing. Later slices are what make `enforce` enqueue, and only as a normal job. |
+| `shadow` | Writes a snapshot and one audit event when the item set changed. An unchanged set bumps `seen_count` on the latest snapshot. Records `mode=shadow` on a new snapshot. Enqueues nothing. |
+| `enforce` | Same write as `shadow`, with `mode=enforce` on a new snapshot. Enqueues nothing. Later slices are what make `enforce` enqueue, and only as a normal job. |
 
 `omg heal show` reads a snapshot that already exists. It does not consult the flag and it does not write.
 
 ## 4. What a snapshot contains
 
-Migration 6 adds `failure_snapshots` and `failure_items`. Each collect inserts one snapshot (`id`, monotonic `seq`, `mode`, `item_count`, `corpus_sha256`, `created_at`) and one item row per failure.
+Migration 6 adds `failure_snapshots` and `failure_items`. Migration 7 adds `seen_count` (default 1) and `last_seen_at` (backfilled from `created_at`). A collect inserts one snapshot (`id`, monotonic `seq`, `mode`, `item_count`, `corpus_sha256`, `created_at`, `seen_count`, `last_seen_at`) and one item row per failure only when the item-set fingerprint differs from the latest snapshot.
 
-An item body is canonical JSON: `json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`. The item sha256 is the SHA-256 of that text. The corpus sha256 is the SHA-256 of the canonical JSON array of those item sha256s, in item order. Order is `(class, job_id, source, identity)`. Identity is `event_id`, else the `event_ids` list, else `review_id`, else `record`, else `job_id`.
+An item body is canonical JSON: `json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`. The item sha256 is the SHA-256 of that text. The corpus sha256 is the SHA-256 of the canonical JSON array of those item sha256s, in item order. That corpus sha256 is the fingerprint. Order is `(class, job_id, source, identity)`. Identity is `event_id`, else the `event_ids` list, else `review_id`, else `record`, else `job_id`.
 
-A second collect on unchanged sources inserts a new snapshot id and the same item sha256s. `created_at` and the snapshot id are not part of an item hash. The `failures_collected` event is not a source, so the audit row from the first collect does not change the second.
+Snapshot id, `created_at`, `last_seen_at`, and `seen_count` are not part of an item hash. Mode is not part of the fingerprint either: a collect whose items match the latest snapshot does not replace that snapshot's mode. A second collect on unchanged sources keeps the same snapshot id, increments `seen_count`, and sets `last_seen_at`. It does not insert a snapshot or a `failures_collected` event. The audit row from the first collect is not a source, so it does not change the fingerprint. A changed item set inserts a new snapshot with `seen_count` 1.
 
 ### Sources in this slice
 
@@ -78,9 +78,10 @@ Collect does not wake a Bot, does not insert a dispatch, and does not change the
 ## 5. Interfaces
 
 - `oh_my_grok/healing.py`: `collect(conn, mode)` and `show(conn, snapshot_id=None)`.
-- `omg heal collect` prints the snapshot id, `sha256:`, the mode, and one line per item (`class`, job id, item sha256). `--json` prints the same object. Exit 5 when the flag is off. Exit 0 when a snapshot was written, including an empty corpus.
-- `omg heal show [SNAPSHOT]` prints the latest snapshot, or that id. Exit 3 when none exists.
-- MCP tool `heal` with `action=collect|show` and optional `snapshot_id` (show only). It is read-only with respect to jobs. It does not require a healer binding. There is no enqueue action.
+- `omg heal collect` prints the snapshot id, `sha256:`, the mode, one line per item (`class`, job id, item sha256), and `status: written` or `status: unchanged`. `--json` prints the same object, including `written`, `status`, and `seen_count`. Exit 5 when the flag is off. Exit 0 when the corpus was collected, including an empty corpus and an unchanged snapshot.
+- `omg heal show [SNAPSHOT]` prints the latest snapshot, or that id, including `seen_count`. Exit 3 when none exists. It does not write.
+- `omg heal prune-duplicates` collapses consecutive snapshots with the same corpus sha256. It keeps the first of each run, sums `seen_count`, and keeps the latest `last_seen_at`. A later non-adjacent run of the same hash is kept. The default is a dry run. `--apply` deletes the duplicate snapshots and their items. Collect and the watchdog never run it.
+- MCP tool `heal` with `action=collect|show` and optional `snapshot_id` (show only). It is read-only with respect to jobs. It does not require a healer binding. There is no enqueue action. An unchanged collect still returns the current item set and does not insert a snapshot.
 
 ## 6. Later slices (not implemented)
 
@@ -89,7 +90,7 @@ Collect does not wake a Bot, does not insert a dispatch, and does not change the
 - **Slice 4.** In `enforce` only, enqueue the proposal as a normal oh-my-grok job. That job still needs a plan, user approval, and review. `shadow` stays record-only.
 - **Slice 5.** A lessons store, and collection from `github_review_bot`.
 
-Until those slices exist, `enforce` and `shadow` have the same effect: a snapshot and an audit event.
+Until those slices exist, `enforce` and `shadow` have the same effect: a snapshot and an audit event when the item set changed, or a `seen_count` bump when it did not.
 
 ## Known gap
 

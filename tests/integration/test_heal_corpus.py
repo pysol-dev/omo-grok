@@ -57,14 +57,17 @@ def test_later_success_with_one_repair_stays_in_the_corpus(harness):
     own = [i for i in first["items"] if i["job_id"] == job]
     assert len(own) == 1 and own[0]["class"] == "repair"
     second = json.loads(_run(["heal", "collect", "--json"]).stdout)
-    assert second["snapshot_id"] != first["snapshot_id"]
+    assert second["written"] is False and second["status"] == "unchanged"
+    assert second["snapshot_id"] == first["snapshot_id"]
+    assert second["seen_count"] == 2
     assert [i["sha256"] for i in second["items"]] == [i["sha256"] for i in first["items"]]
+    assert "unchanged" in _run(["heal", "collect"]).stdout
     assert second["sha256"] in _run(["heal", "show"]).stdout
     row = h.e._job(job)
     assert row["phase"] == "done" and row["repair_cycles"] == 1 and row["version"] == version
     after = [r["kind"] for r in h.e._all("SELECT kind FROM events ORDER BY id")]
     assert after[:len(before)] == before
-    assert after[len(before):] == ["failures_collected", "failures_collected"]
+    assert after[len(before):] == ["failures_collected"]
 
 
 def _count_new_work(h, job):

@@ -33,7 +33,7 @@ user ─chat─▶ Hephaestus ─MCP─▶ omg engine ◀─MCP── role routi
 | `skills.py` | Delivers the git-master skill text into the executor packet. Delivery is not proof the model obeyed it |
 | `operational.py` | Derives the doctor live-status line from recorded evidence. Never a constant |
 | `mcp_server.py` | The 11 MCP tools (pydantic-validated): submit, claim, context, checkpoint, complete, status, reconcile, cancel, escalate, docs, heal. `heal` projects the failure corpus and does not require a role binding. Logs go to stderr, redacted. No approve/ship/shell/secret tools |
-| `cli.py` | `omg`: doctor, migrate, status, submit, plan show, approve/deny (TTY), cancel (TTY), resume, reconcile, export, backup/restore, hook set/check/list, roles, heal collect/show, test |
+| `cli.py` | `omg`: doctor, migrate, status, submit, plan show, approve/deny (TTY), cancel (TTY), resume, reconcile, export, backup/restore, hook set/check/list, roles, heal collect/show/prune-duplicates, test |
 | `transport.py` | Bounded-timeout HTTP POST (stdlib). Hook URLs must be https (`hooks.py`); plain http is accepted only for 127.0.0.1/localhost with `OMG_ALLOW_INSECURE_HOOKS=1` (tests) |
 | `hooks.py` | Webhook URL and key store `state/secrets/hooks.json` (0600 file in a 0700 dir). Separate from job state |
 | `artifacts.py` | Immutable, content-addressed artifact files. Path-traversal and symlink checks. sha256 verified on read |
@@ -59,7 +59,7 @@ The tables:
 - `role_bindings` (versioned)
 - `dispatch_outbox`, `verifications`, `reviews`, `gate_results`
 - `events` (append-only audit)
-- `failure_snapshots`, `failure_items` (migration 6): append-only projection of the failure corpus. `omg heal collect` writes them. They are not read back to decide a transition
+- `failure_snapshots`, `failure_items` (migration 6; `seen_count` and `last_seen_at` in migration 7): projection of the failure corpus. `omg heal collect` writes a snapshot when the item set changed and otherwise bumps the latest row. They are not read back to decide a transition. `omg heal prune-duplicates --apply` is the only delete, and it is manual
 - `hooks_meta` (booleans only)
 - `schema_migrations` (version and checksum)
 

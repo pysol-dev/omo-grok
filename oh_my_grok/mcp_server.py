@@ -207,10 +207,12 @@ def escalate(job_id: Id, to_class: Literal["standard", "heavy"],
 
 
 @server.tool(description="Project the failure corpus. action=collect writes one snapshot and a failures_collected "
-                         "audit event when healing is shadow or enforce, and writes nothing when healing is off. "
-                         "It does not change job phase, tasks, or dispatch, and it does not enqueue a fix. "
-                         "action=show reads the latest snapshot, or snapshot_id. No role binding is required. "
-                         "The snapshot is a projection, not authority; do not read the database to invent a corpus.")
+                         "audit event when healing is shadow or enforce and the item set changed. An unchanged "
+                         "item set bumps seen_count on the latest snapshot and does not insert another. Healing "
+                         "off writes nothing. It does not change job phase, tasks, or dispatch, and it does not "
+                         "enqueue a fix. action=show reads the latest snapshot, or snapshot_id. No role binding "
+                         "is required. The snapshot is a projection, not authority; do not read the database to "
+                         "invent a corpus.")
 def heal(action: Literal["collect", "show"],
          snapshot_id: Annotated[str | None, Field(pattern=UUID)] = None) -> dict[str, Any]:
     def run(e: Engine) -> dict[str, Any]:

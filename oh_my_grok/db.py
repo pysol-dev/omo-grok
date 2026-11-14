@@ -350,6 +350,11 @@ CREATE TABLE failure_items (
 );
 CREATE INDEX failure_items_job ON failure_items(job_id);
 """),
+    (7, "failure_snapshot_seen", """
+ALTER TABLE failure_snapshots ADD COLUMN seen_count INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE failure_snapshots ADD COLUMN last_seen_at TEXT NOT NULL DEFAULT '';
+UPDATE failure_snapshots SET last_seen_at = created_at WHERE last_seen_at = '';
+"""),
 ]
 
 LATEST_VERSION = MIGRATIONS[-1][0]

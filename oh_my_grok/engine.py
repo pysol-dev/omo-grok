@@ -161,8 +161,8 @@ class Engine:
     def heal_collect(self) -> dict:
         """Project the failure corpus (spec/HEALING.md). Uses the current policy, not a job's frozen flag.
 
-        Does not change jobs, tasks, or dispatch, and does not flush the boulder projection. The only new event is
-        ``failures_collected``, written by ``healing.collect`` with a null job id."""
+        Does not change jobs, tasks, or dispatch, and does not flush the boulder projection. A new snapshot writes
+        one ``failures_collected`` event with a null job id. An unchanged item set only bumps that snapshot."""
         pol = self.policy
         return healing.collect(self.conn, pol["features"]["healing"], now=time.time(),
                                stall_awaiting_resume_seconds=float(pol["stall_awaiting_resume_seconds"]),
@@ -170,6 +170,10 @@ class Engine:
 
     def heal_show(self, snapshot_id: str | None = None) -> dict:
         return healing.show(self.conn, snapshot_id)
+
+    def heal_prune_duplicates(self, *, apply: bool = False) -> dict:
+        """Collapse consecutive identical heal snapshots. Dry-run unless ``apply``. Never called from the loop."""
+        return healing.prune_duplicates(self.conn, apply=apply)
 
     def _ev(self, ev_kind, job_id=None, task_id=None, actor=None, correlation_id=None, **data):
         if job_id:

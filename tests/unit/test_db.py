@@ -11,12 +11,12 @@ from oh_my_grok.states import (DISPATCH_STATUSES, JOB_PHASES, TASK_STATUSES, che
 
 def test_migrations_apply_once_and_record_checksums(tmp_path):
     c = db.connect(tmp_path / "x.sqlite3")
-    assert db.migrate(c, dry_run=True) == [1, 2, 3, 4, 5, 6]
+    assert db.migrate(c, dry_run=True) == [1, 2, 3, 4, 5, 6, 7]
     assert db.current_version(c) == 0
-    assert db.migrate(c) == [1, 2, 3, 4, 5, 6]
+    assert db.migrate(c) == [1, 2, 3, 4, 5, 6, 7]
     assert db.migrate(c) == []
     rows = c.execute("SELECT version, checksum FROM schema_migrations").fetchall()
-    assert [r[0] for r in rows] == [1, 2, 3, 4, 5, 6] and all(len(r[1]) == 64 for r in rows)
+    assert [r[0] for r in rows] == [1, 2, 3, 4, 5, 6, 7] and all(len(r[1]) == 64 for r in rows)
     tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     for t in ["jobs", "tasks", "task_attempts", "artifacts", "plan_revisions", "approvals", "role_bindings",
               "dispatch_outbox", "verifications", "reviews", "events", "hooks_meta", "gate_results",
@@ -28,7 +28,7 @@ def test_partial_migration_target(tmp_path):
     c = db.connect(tmp_path / "x.sqlite3")
     assert db.migrate(c, target=1) == [1]
     assert db.current_version(c) == 1
-    assert db.migrate(c) == [2, 3, 4, 5, 6]
+    assert db.migrate(c) == [2, 3, 4, 5, 6, 7]
 
 
 def test_checksum_mismatch_detected(tmp_path):
@@ -179,7 +179,7 @@ def test_auto_backup_before_migrating_nonempty_db(omg_home):
     db.migrate(c, target=1)
     c.close()
     e = Engine()
-    assert db.current_version(e.conn) == db.LATEST_VERSION == 6
+    assert db.current_version(e.conn) == db.LATEST_VERSION == 7
     assert list(p.backups_dir.glob("pre-migrate-v1-*.sqlite3"))
     e.close()
 

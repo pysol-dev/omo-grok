@@ -23,6 +23,11 @@ FIXTURE_SCOPE = {"files_estimate": 1, "new_dependency": False, "external_api": F
                  "security_sensitive": False, "cross_cutting": False}
 
 
+def _pause(seconds: float) -> None:
+    """Poll wait. Tests replace this function. Replacing ``time.sleep`` also stops ``subprocess``."""
+    time.sleep(seconds)
+
+
 def prerequisites(e: Engine) -> list[str]:
     missing = []
     for b in e.list_bindings():
@@ -64,7 +69,7 @@ def run_live_fixture(timeout: int = 3600, poll: int = 60) -> dict:
                 break
             if s.get("awaiting_resume"):
                 log.append(f"waiting for Hephaestus to resume tasks in chat: {s['awaiting_resume']}")
-            time.sleep(poll)
+            _pause(poll)
         s = e.status(job, include_events=True)
         ok = s["phase"] == "done" and any(g["passed"] for g in s["gates"])
         return {"result": "PASSED" if ok else ("TIMEOUT" if s["phase"] not in ("blocked", "failed", "cancelled")

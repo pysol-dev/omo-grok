@@ -250,7 +250,19 @@ def _heal(engine: Engine) -> dict:
         snap = engine.heal_collect()
     except GateRefused as exc:
         return {"skipped": True, "reason": redact(exc.message)[:200]}
-    return {"snapshot_id": snap["snapshot_id"], "item_count": snap["item_count"], "mode": snap["mode"]}
+    status = snap.get("status")
+    if status not in ("written", "unchanged"):
+        status = "written" if snap.get("written", True) else "unchanged"
+    return {"snapshot_id": snap["snapshot_id"], "item_count": snap["item_count"], "mode": snap["mode"],
+            "written": bool(snap.get("written")), "status": status}
+
+
+def _tick_label(name: str, step: dict) -> str:
+    if not step.get("ok"):
+        return f"{name}=fail"
+    if name == "heal_collect" and step.get("status") in ("written", "unchanged"):
+        return f"{name}={step['status']}"
+    return f"{name}=ok"
 
 
 def _latest(engine: Engine, task_id: str, kind: str) -> dict | None:
@@ -394,8 +406,7 @@ def tick(engine: Engine, *, now: float | None = None, interval: float | None = N
             log.error("step %s failed: %s", name, step.get("error", ""))
     payload = _write_heartbeat(engine.paths, {
         "unix": moment, "ts": db.utcnow(), "mode": mode, "interval_seconds": step_interval, "steps": outcomes})
-    log.info("tick mode=%s %s", mode, " ".join(
-        f"{name}={'ok' if step.get('ok') else 'fail'}" for name, step in outcomes.items()))
+    log.info("tick mode=%s %s", mode, " ".join(_tick_label(name, step) for name, step in outcomes.items()))
     return payload
 
 

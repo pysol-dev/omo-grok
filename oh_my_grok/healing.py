@@ -1,9 +1,14 @@
 """Failure-corpus projection (spec/HEALING.md).
 
 Like the boulder file, a snapshot is derived and is never read back to decide a transition. ``collect`` reads jobs,
-rejected reviews, ``repair_cycle`` events, and stalled tasks. It does not read ``failure_snapshots``. The only write,
-besides the snapshot rows, is one ``failures_collected`` audit event with a null job id, so no job is marked dirty
-and no boulder is flushed. Stall rows are a projection: collect does not wake a Bot and does not change a task.
+rejected reviews, ``repair_cycle`` events, and stalled tasks. It reads ``failure_snapshots`` only to compare the
+latest corpus hash: an unchanged item set bumps ``seen_count`` and ``last_seen_at`` on that row instead of inserting
+another snapshot. The item set itself is never taken from stored rows. A new snapshot also writes one
+``failures_collected`` audit event with a null job id, so no job is marked dirty and no boulder is flushed. An
+unchanged collect does not append that event. Stall rows are a projection: collect does not wake a Bot and does not
+change a task.
+
+``prune_duplicates`` is an operator command. Collect and the watchdog never call it.
 
 ``github_review_bot`` is reserved for a later slice and is not read.
 """
@@ -204,9 +209,29 @@ def _corpus(items: list[dict]) -> str:
     return sha256_text(canonical_json([i["sha256"] for i in items]))
 
 
+def _fingerprint(items: list[dict]) -> str:
+    """Stable id of the projected item set.
+
+    Item hashes cover the payload only. Snapshot ids, ``created_at``, ``last_seen_at``, and ``seen_count`` are
+    assigned per collect and are not inputs, so a later collect of the same sources hashes the same.
+    """
+    return _corpus(items)
+
+
+def _result(row, items: list[dict], corpus: str, *, written: bool, seen_count: int, last_seen_at: str) -> dict:
+    status = "written" if written else "unchanged"
+    return {"written": written, "unchanged": not written, "status": status, "mode": row["mode"],
+            "snapshot_id": row["id"], "seq": row["seq"], "sha256": corpus, "corpus_sha256": corpus,
+            "fingerprint": corpus, "item_count": len(items), "items": items, "seen_count": seen_count,
+            "last_seen_at": last_seen_at, "created_at": row["created_at"]}
+
+
 def collect(conn, mode: str, *, now: float | None = None, stall_awaiting_resume_seconds: float = 600,
             lease_seconds: float = 1800) -> dict:
-    """Write one snapshot. ``off`` raises and writes nothing. ``shadow`` and ``enforce`` both write; neither enqueues.
+    """Record the current corpus. ``off`` raises and writes nothing. ``shadow`` and ``enforce`` do not enqueue.
+
+    A new snapshot is inserted only when the item-set fingerprint differs from the latest snapshot. The same set
+    bumps ``seen_count`` and ``last_seen_at`` on that snapshot and does not append another audit event.
 
     Stall ages use wall-clock ``now`` (default ``time.time()``), not the engine's test clock, so a harness that
     freezes leases does not mark every fresh task stalled.
@@ -220,11 +245,22 @@ def collect(conn, mode: str, *, now: float | None = None, stall_awaiting_resume_
     with db.tx(conn):
         items = _project(conn, now=now, stall_awaiting_resume_seconds=stall_awaiting_resume_seconds,
                          lease_seconds=lease_seconds)
-        corpus = _corpus(items)
+        corpus = _fingerprint(items)
+        latest = conn.execute(
+            "SELECT id, seq, mode, corpus_sha256, created_at, seen_count FROM failure_snapshots "
+            "ORDER BY seq DESC LIMIT 1").fetchone()
+        if latest is not None and latest["corpus_sha256"] == corpus:
+            seen = int(latest["seen_count"]) + 1
+            seen_at = db.utcnow()
+            conn.execute("UPDATE failure_snapshots SET seen_count=?, last_seen_at=? WHERE id=?",
+                         (seen, seen_at, latest["id"]))
+            return _result(latest, items, corpus, written=False, seen_count=seen, last_seen_at=seen_at)
         seq = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM failure_snapshots").fetchone()[0] + 1
         sid = str(uuid.uuid4())
-        conn.execute("INSERT INTO failure_snapshots(id,seq,mode,item_count,corpus_sha256,created_at) "
-                     "VALUES (?,?,?,?,?,?)", (sid, seq, mode, len(items), corpus, db.utcnow()))
+        created = db.utcnow()
+        conn.execute(
+            "INSERT INTO failure_snapshots(id,seq,mode,item_count,corpus_sha256,created_at,seen_count,last_seen_at) "
+            "VALUES (?,?,?,?,?,?,?,?)", (sid, seq, mode, len(items), corpus, created, 1, created))
         for item in items:
             conn.execute(
                 "INSERT INTO failure_items(snapshot_id,ordinal,item_sha256,class,source,job_id,task_id,payload_json) "
@@ -236,8 +272,59 @@ def collect(conn, mode: str, *, now: float | None = None, stall_awaiting_resume_
                      (db.utcnow(), None, None, "failures_collected", "engine", sid,
                       canonical_json({"corpus_sha256": corpus, "item_count": len(items), "mode": mode,
                                       "snapshot_id": sid})))
-    return {"written": True, "mode": mode, "snapshot_id": sid, "seq": seq, "sha256": corpus,
-            "corpus_sha256": corpus, "item_count": len(items), "items": items}
+        row = {"id": sid, "seq": seq, "mode": mode, "created_at": created}
+    return _result(row, items, corpus, written=True, seen_count=1, last_seen_at=created)
+
+
+def prune_duplicates(conn, *, apply: bool = False) -> dict:
+    """Collapse consecutive snapshots that share a corpus hash, keeping the first of each run.
+
+    Default is a dry run. ``apply=True`` deletes the later rows in each run and their items, and stores the summed
+    ``seen_count`` and the latest ``last_seen_at`` on the kept row. A later non-adjacent run of the same hash is
+    kept. This is never invoked by ``collect`` or the watchdog.
+    """
+    def plan():
+        rows = list(conn.execute(
+            "SELECT id, seq, corpus_sha256, seen_count, last_seen_at, created_at "
+            "FROM failure_snapshots ORDER BY seq"))
+        groups: list[list] = []
+        for row in rows:
+            if groups and groups[-1][0]["corpus_sha256"] == row["corpus_sha256"]:
+                groups[-1].append(row)
+            else:
+                groups.append([row])
+        collapsed, removed = [], []
+        for group in groups:
+            if len(group) < 2:
+                continue
+            stamps = [(r["last_seen_at"] or r["created_at"]) for r in group]
+            collapsed.append({
+                "snapshot_id": group[0]["id"], "seq": group[0]["seq"],
+                "corpus_sha256": group[0]["corpus_sha256"],
+                "seen_count": sum(int(r["seen_count"] or 1) for r in group),
+                "last_seen_at": max(stamps), "removed": len(group) - 1})
+            removed.extend(r["id"] for r in group[1:])
+        return rows, collapsed, removed
+
+    def report(rows, collapsed, removed, *, applied: bool) -> dict:
+        before = len(rows)
+        deleted = len(removed) if applied else 0
+        return {"dry_run": not applied, "applied": applied, "would_delete": len(removed), "deleted": deleted,
+                "removed_ids": list(removed), "kept_count": before - len(removed),
+                "snapshots_before": before, "snapshots_after": before - deleted, "collapsed": collapsed}
+
+    if not apply:
+        rows, collapsed, removed = plan()
+        return report(rows, collapsed, removed, applied=False)
+    with db.tx(conn):
+        rows, collapsed, removed = plan()
+        for group in collapsed:
+            conn.execute("UPDATE failure_snapshots SET seen_count=?, last_seen_at=? WHERE id=?",
+                         (group["seen_count"], group["last_seen_at"], group["snapshot_id"]))
+        for sid in removed:
+            conn.execute("DELETE FROM failure_items WHERE snapshot_id=?", (sid,))
+            conn.execute("DELETE FROM failure_snapshots WHERE id=?", (sid,))
+        return report(rows, collapsed, removed, applied=True)
 
 
 def show(conn, snapshot_id: str | None = None) -> dict:
@@ -257,6 +344,8 @@ def show(conn, snapshot_id: str | None = None) -> dict:
                           "WHERE snapshot_id=? ORDER BY ordinal", (row["id"],)):
         items.append({"ordinal": r["ordinal"], "sha256": r["item_sha256"], "class": r["class"],
                       "source": r["source"], "job_id": r["job_id"], "payload": json.loads(r["payload_json"])})
+    last_seen = row["last_seen_at"] or row["created_at"]
     return {"snapshot_id": row["id"], "seq": row["seq"], "mode": row["mode"], "sha256": row["corpus_sha256"],
-            "corpus_sha256": row["corpus_sha256"], "item_count": row["item_count"], "created_at": row["created_at"],
-            "items": items}
+            "corpus_sha256": row["corpus_sha256"], "fingerprint": row["corpus_sha256"],
+            "item_count": row["item_count"], "created_at": row["created_at"], "seen_count": row["seen_count"],
+            "last_seen_at": last_seen, "items": items}
